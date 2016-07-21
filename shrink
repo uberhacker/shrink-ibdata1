@@ -66,5 +66,5 @@ if ! test $1; then
   fi
 fi
 SIZE_AFTER=$(df -P . | awk 'NR==2 {print $4}')
-SIZE_SAVED=$(($SIZE_BEFORE-$SIZE_AFTER))
+SIZE_SAVED=$(($SIZE_AFTER-$SIZE_BEFORE))
 echo "Shrunk /var/lib/mysql/ibdata1 and recovered $SIZE_SAVED kilobytes."
