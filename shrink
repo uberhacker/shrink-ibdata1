@@ -2,9 +2,15 @@
 cd
 MYSQL_USER=root
 MYSQL_PASS=root
+MYSQL_SERVICE=mysql
 MYSQL=$(which mysql)
 if [ $? == 1 ]; then
   echo "MySQL is not installed."
+  exit 1
+fi
+MYSQL_DUMP=$(which mysqldump)
+if [ $? == 1 ]; then
+  echo "Unable to execute mysqldump."
   exit 1
 fi
 if test $1; then
@@ -17,36 +23,42 @@ if test $1; then
 fi
 MYSQLD=$(pidof mysqld)
 if [ -z "$MYSQLD" ]; then
-  sudo service mysql start
+  sudo service $MYSQL_SERVICE start
 fi
-DBS=$($MYSQL -u$MYSQL_USER -p$MYSQL_PASS -e 'show databases' | awk '{print $1}' | grep -v '^Database')
+if ! $MYSQL -u$MYSQL_USER -p$MYSQL_PASS  -e ';' 2> /dev/null; then
+  read -sp "Enter the MySQL $MYSQL_USER password: " MYSQL_PASS
+  if ! $MYSQL -u$MYSQL_USER -p$MYSQL_PASS  -e ';' 2> /dev/null; then
+    echo "Invalid password."
+    exit 1
+  fi
+fi
+DBS="$($MYSQL -u$MYSQL_USER -p$MYSQL_PASS -e 'show databases' | awk '{print $1}' | grep -v '^Database')"
 SAVE_DBS="information_schema mysql performance_schema"
 SIZE_BEFORE=$(df -P . | awk 'NR==2 {print $4}')
-if [[ "$DBS" != "$SAVE_DBS" ]]; then
-  for DB in $DBS; do
-    DROP=1
-    for SAVE_DB in $SAVE_DBS; do
-      if [ $SAVE_DB == $DB ]; then
-        DROP=0
-        break
-      fi
-    done
-    if [ $DROP == 1 ]; then
-      echo "Dumping $DB database..."
-      mysqldump -u$MYSQL_USER -p$MYSQL_PASS $DB | gzip > $DB.sql.gz
-      if [ -f $DB.sql.gz ]; then
-        echo "Database $DB backed up successfully."
-        echo "Dropping $DB database..."
-        $MYSQL -u$MYSQL_USER -p$MYSQL_PASS -e "drop database $DB"
-      else
-        echo "Backup of database $DB failed."
-      fi
+for DB in $DBS; do
+  DROP=1
+  for SAVE_DB in $SAVE_DBS; do
+    if [ $SAVE_DB == $DB ]; then
+      DROP=0
+      break
     fi
   done
-fi
-sudo service mysql stop
+  if [ $DROP == 1 ]; then
+    echo "Dumping $DB database..."
+    $MYSQL_DUMP -u$MYSQL_USER -p$MYSQL_PASS $DB | gzip > $DB.sql.gz
+    if [ -f $DB.sql.gz ]; then
+      echo "Database $DB backed up successfully."
+      echo "Dropping $DB database..."
+      $MYSQL -u$MYSQL_USER -p$MYSQL_PASS -e "drop database $DB"
+    else
+      echo "Backup of database $DB failed."
+      exit 1
+    fi
+  fi
+done
+sudo service $MYSQL_SERVICE stop
 sudo rm -f /var/lib/mysql/ib*
-sudo service mysql start
+sudo service $MYSQL_SERVICE start
 if ! test $1; then
   if [[ "$DBS" != "$SAVE_DBS" ]]; then
     for DB in $DBS; do
