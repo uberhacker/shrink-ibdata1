@@ -26,3 +26,6 @@ To shrink the MySQL metadata file and keep the backups instead of restoring the 
 $ shrink -k
 ```
 You might want to do this if you wish to clear out MySQL of any existing databases.
+
+> #### Warning::Make a backup of your databases just in case
+> Although this script will perform a backup and restore of the databases, it is still advisable to make your own backup of /var/lib/mysql and all the databases prior to using.
