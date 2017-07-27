@@ -34,7 +34,7 @@ if ! $MYSQL -u$MYSQL_USER -p$MYSQL_PASS  -e ';' 2> /dev/null; then
 fi
 DBS="$($MYSQL -u$MYSQL_USER -p$MYSQL_PASS -e 'show databases' | awk '{print $1}' | grep -v '^Database')"
 SAVE_DBS="information_schema mysql performance_schema"
-SIZE_BEFORE=$(df -P . | awk 'NR==2 {print $4}')
+SIZE_BEFORE=$(du /var/lib/mysql/ibdata1 | cut -d$'\t' -f1)
 for DB in $DBS; do
   DROP=1
   for SAVE_DB in $SAVE_DBS; do
@@ -77,6 +77,6 @@ if ! test $1; then
     done
   fi
 fi
-SIZE_AFTER=$(df -P . | awk 'NR==2 {print $4}')
-SIZE_SAVED=$(($SIZE_AFTER-$SIZE_BEFORE))
+SIZE_AFTER=$(du /var/lib/mysql/ibdata1 | cut -d$'\t' -f1)
+SIZE_SAVED=$(($SIZE_BEFORE-$SIZE_AFTER))
 echo "Shrunk /var/lib/mysql/ibdata1 and recovered $SIZE_SAVED kilobytes."
