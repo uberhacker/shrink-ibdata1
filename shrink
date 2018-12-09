@@ -4,6 +4,9 @@
 
 # Constants
 MYSQL_USER=root
+# If no password is defined, then you'll be prompted for one if necessary
+#MYSQL_PASS=
+# Path to the mysql databases:
 MYSQL_DATA_DIR=/var/lib/mysql
 
 
@@ -33,35 +36,104 @@ die() {	# params: exit code; message
     warn "$@"
     exit "$rc"
 }
+service_mysql_is_running() {
+	if [ -n "$(command -v service)" ]; then
+		if service mysql status > /dev/null; then
+			return 0
+		fi
+		return 1
+	elif [ -f /etc/init.d/mysql ]; then
+		if /etc/init.d/mysql status > /dev/null; then
+			return 0
+		fi
+		return 1
+	elif [ -f /usr/local/etc/rc.d/mysql ]; then
+		if /usr/local/etc/rc.d/mysql status > /dev/null; then
+			return 0
+		fi
+		return 1
+	else
+		#die 1 "Fix me: I don't know how to determine if mysql is running";
+		if [ -z "$(pidof mysqld)" ]; then
+			return 0
+		fi
+		return 1
+	fi
+}
+service_mysql_start() {
+	printf 'Starting mysql service... '
+	if [ -n "$(command -v service)" ]; then
+		if ! service mysql start; then
+			die $? 'ERROR: Failed to start mysql service!'
+		fi
+	elif [ -f /etc/init.d/mysql ]; then
+		if ! /etc/init.d/mysql start > /dev/null; then
+			die $? 'ERROR: Failed to start mysql service!'
+		fi
+	elif [ -f /usr/local/etc/rc.d/mysql ]; then	# FreeBSD
+		if ! /usr/local/etc/rc.d/mysql start > /dev/null; then
+			die $? 'ERROR: Failed to start mysql service!'
+		fi
+	else
+		die 1 "Fix me: I don't know how to start mysql";
+	fi
+	echo 'OK'
+}
+service_mysql_stop() {
+	printf 'Stopping mysql service... '
+	if [ -n "$(command -v service)" ]; then
+		if ! service mysql stop; then
+			die $? 'ERROR: Failed to stop mysql service!'
+		fi
+	elif [ -f /etc/init.d/mysql ]; then
+		if ! /etc/init.d/mysql stop > /dev/null; then
+			die $? 'ERROR: Failed to stop mysql service!'
+		fi
+	elif [ -f /usr/local/etc/rc.d/mysql ]; then	# FreeBSD
+		if ! /usr/local/etc/rc.d/mysql stop > /dev/null; then
+			die $? 'ERROR: Failed to stop mysql service!'
+		fi
+	else
+		die 1 "Fix me: I don't know how to stop mysql";
+	fi
+	echo 'OK'
+}
 usage() {
 	msg="$*"
 	this=$(basename "$0")
 	if [ -n "$msg" ]; then
 		warn "$this: ERROR: $msg"
 	fi
-	warn "Usage: $this [-dk]"
+	warn "Usage: $this [-[dhky]] start"
 	warn '	Arguments:'
-	warn "		-c or --continue: Continue after failure. This restores all previously made *.sql.gz files too."
+	#warn "		-c or --continue: Continue after failure. This restores all previously made *.sql.gz files too."
 	warn "		-d or --dry-run: Do not drop databases, remove files from $MYSQL_DATA_DIR, or restore databases."
 	warn '		-h or --help: Show this.'
+	warn '		-k or --keep: Keep backup files.'
+	warn '		-y or --yes: Automatically answer yes to all prompts.'
+	warn "Note: Backups will be made into the current working directory ($(pwd))."
 	if [ -n "$msg" ]; then
 		exit 1
 	fi
 	exit 0
 }
 
-
 # Command line arguments
 while :
 do
 	case "$1" in
-		-c) CONTINUE=1;;
-		--continue) CONTINUE=1;;
+		-c) CONTINUE=1;;			# undocumented option
+		--continue) CONTINUE=1;;	# undocumented option
 		-d) DRYRUN=1;;
 		--dry-run) DRYRUN=1;;
 		-h) usage;;
 		--help) usage;;
-		-t) TEST=1;;	# secret option
+		-k) KEEP_BACKUPS=1;;
+		--keep) KEEP_BACKUPS=1;;
+		-t) TEST=1;;		# undocumented option
+		--test) TEST=1;;	# undocumented option
+		-y) YES=1;;
+		--yes) YES=1;;
 		#-o) shift; o="$1";;
 		#--) shift; break;;
 		-*) usage "bad argument $1";;
@@ -69,6 +141,10 @@ do
 	esac
 	shift
 done
+# This forces the use to read the usage before actually running the process
+if [ -z "$*" ] || [ "$*" != 'start' ]; then
+	usage
+fi
 if [ -n "$DRYRUN" ]; then
 	echo '*** DRY RUN ***'
 fi
@@ -97,7 +173,7 @@ fi
 if [ -z "$(command -v mysqldump)" ]; then
 	die $? 'mysqldump not found!'
 fi
-GZIP="$(command -v pigz)"
+GZIP="$(command -v pigz)"	# compatible with, but faster than gzip
 if [ -z "$GZIP" ]; then
 	GZIP="$(command -v gzip)"
 	if [ -z "$GZIP" ]; then
@@ -113,9 +189,8 @@ fi
 
 
 # Make sure mysqld is running
-if [ -z "$(pidof mysqld)" ]; then
-	echo "Starting mysql service."
-	service mysql start || die 1 "Failed to start mysql: $?"
+if service_mysql_is_running; then
+	service_mysql_start
 else
 	echo 'Found active mysql service.'
 fi
@@ -127,7 +202,9 @@ if mysql -u"$MYSQL_USER" -e ';' 2>/dev/null; then
 	# password is ignored for auth_socket authentication, but must be at least 1 character if the -p argument is given
 	MYSQL_PASS='dummy'
 else
-	read -rsp "Enter the MySQL $MYSQL_USER password: " MYSQL_PASS
+	if [ -z "$MYSQL_PASS" ]; then
+		read -rsp "Enter the MySQL $MYSQL_USER password: " MYSQL_PASS
+	fi
 	if ! mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -e ';' 2> /dev/null; then
 		echo 'Invalid password.'
 		exit 1
@@ -135,8 +212,9 @@ else
 fi
 
 
-SIZE_BEFORE=$(du -h "$IBDATA1_FILE" | cut -f1)
-echo "Current size of $IBDATA1_FILE: $SIZE_BEFORE"
+SIZE_BEFORE=$(du "$IBDATA1_FILE" | cut -f1)
+SIZE_BEFORE_HUMAN=$(du -h "$IBDATA1_FILE" | cut -f1)
+echo "Current size of $IBDATA1_FILE: $SIZE_BEFORE_HUMAN"
 
 
 # List databases
@@ -152,12 +230,13 @@ echo "Databases to backup into the current directory ($(pwd)) and then drop:"
 for DATABASE in $DATABASES; do
 	echo "	$DATABASE"
 done
-if ! prompt_yn 'Do you really want to continue?'; then
+if [ -z "$YES" ] && ! prompt_yn 'Do you really want to continue?'; then
 	exit 0
 fi
 
 
 ## Backup and drop databases
+umask 077
 for DATABASE in $DATABASES; do
 	FILE="$DATABASE.sql.gz"
 	printf 'Backup %s to %s... ' "$DATABASE" "$FILE"
@@ -191,11 +270,7 @@ done
 
 
 # Stop mysql; delete ib* files; start mysql
-printf 'Stopping mysql service... '
-if ! service mysql stop; then
-	die $? 'ERROR: Failed to stop mysql service!'
-fi
-echo 'OK'
+service_mysql_stop
 for x in "$MYSQL_DATA_DIR"/ibdata? "$MYSQL_DATA_DIR"/ib_logfile*; do
 	if [ -f "$x" ]; then
 		printf 'Remove %s (%s)... ' "$x" "$(du -h "$x" | cut -f1)"
@@ -209,11 +284,7 @@ for x in "$MYSQL_DATA_DIR"/ibdata? "$MYSQL_DATA_DIR"/ib_logfile*; do
 		fi
 	fi
 done
-printf 'Starting mysql service... '
-if ! service mysql start; then
-	die $? 'ERROR: Failed to start mysql service!'
-fi
-echo 'OK'
+service_mysql_start
 
 # Restoring
 if [ -n "$CONTINUE" ]; then
@@ -243,7 +314,7 @@ if [ -n "$CONTINUE" ]; then
 	for DATABASE in $DATABASES; do
 		echo "	$DATABASE"
 	done
-	if ! prompt_yn 'Do you really want to continue?'; then
+	if [ -z "$YES" ] && ! prompt_yn 'Do you really want to continue?'; then
 		exit 0
 	fi
 fi
@@ -256,7 +327,9 @@ for DATABASE in $DATABASES; do
 				die $? 'ERROR'
 			fi
 			echo 'OK'
-			rm -f "$FILE"
+			if [ -z "$KEEP_BACKUPS" ]; then
+				rm -f "$FILE"
+			fi
 		else
 			echo '(Skipped in DRY RUN)'
 		fi
@@ -264,6 +337,12 @@ for DATABASE in $DATABASES; do
 done
 
 
-echo "Size of $IBDATA1_FILE before shrinking: $SIZE_BEFORE"
-SIZE_AFTER=$(du -h "$IBDATA1_FILE" | cut -f1)
-echo "Size of $IBDATA1_FILE after shrinking: $SIZE_AFTER"
+# Statistics
+echo "Size of $IBDATA1_FILE before shrinking: $SIZE_BEFORE_HUMAN"
+SIZE_AFTER_HUMAN=$(du -h "$IBDATA1_FILE" | cut -f1)
+SIZE_AFTER=$(du "$IBDATA1_FILE" | cut -f1)
+printf "Size of %s after shrinking: %s (%.1f%% of original; space recovered=%d bytes)\n" \
+	"$IBDATA1_FILE" \
+	"$SIZE_AFTER_HUMAN" \
+	"$(awk "BEGIN { print "100*"$SIZE_AFTER"/"$SIZE_BEFORE"" }")" \
+	"$(("$SIZE_BEFORE"-"$SIZE_AFTER"))"
