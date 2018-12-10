@@ -1,82 +1,348 @@
 #!/bin/bash
-cd
+# Checked by https://www.shellcheck.net/
+
+
+# Constants
 MYSQL_USER=root
-MYSQL_PASS=root
-MYSQL_SERVICE=mysql
-MYSQL=$(which mysql)
-if [ $? == 1 ]; then
-  echo "MySQL is not installed."
-  exit 1
-fi
-MYSQL_DUMP=$(which mysqldump)
-if [ $? == 1 ]; then
-  echo "Unable to execute mysqldump."
-  exit 1
-fi
-if test $1; then
-  if [[ "$1" != "-k" ]]; then
-    echo "Invalid switch $1."
-    echo "Usage: $0 [-k]"
-    echo "Use the -k switch to keep backups instead of restoring the databases"
-    exit 1
-  fi
-fi
-MYSQLD=$(pidof mysqld)
-if [ -z "$MYSQLD" ]; then
-  sudo service $MYSQL_SERVICE start
-fi
-if ! $MYSQL -u$MYSQL_USER -p$MYSQL_PASS  -e ';' 2> /dev/null; then
-  read -sp "Enter the MySQL $MYSQL_USER password: " MYSQL_PASS
-  if ! $MYSQL -u$MYSQL_USER -p$MYSQL_PASS  -e ';' 2> /dev/null; then
-    echo "Invalid password."
-    exit 1
-  fi
-fi
-DBS="$($MYSQL -u$MYSQL_USER -p$MYSQL_PASS -e 'show databases' | awk '{print $1}' | grep -v '^Database')"
-SAVE_DBS="information_schema mysql performance_schema"
-SIZE_BEFORE=$(du /var/lib/mysql/ibdata1 | cut -d$'\t' -f1)
-for DB in $DBS; do
-  DROP=1
-  for SAVE_DB in $SAVE_DBS; do
-    if [ $SAVE_DB == $DB ]; then
-      DROP=0
-      break
-    fi
-  done
-  if [ $DROP == 1 ]; then
-    echo "Dumping $DB database..."
-    $MYSQL_DUMP -u$MYSQL_USER -p$MYSQL_PASS $DB | gzip > $DB.sql.gz
-    if [ -f $DB.sql.gz ]; then
-      echo "Database $DB backed up successfully."
-      echo "Dropping $DB database..."
-      $MYSQL -u$MYSQL_USER -p$MYSQL_PASS -e "drop database \`$DB\`"
-    else
-      echo "Backup of database $DB failed."
-      exit 1
-    fi
-  fi
+# If no password is defined, then you'll be prompted for one if necessary
+#MYSQL_PASS=
+# Path to the mysql databases:
+MYSQL_DATA_DIR=/var/lib/mysql
+
+
+# Functions
+prompt_yn() {	# params: message
+	msg="$*"
+	if [ -z "$msg" ]; then
+		msg='Are you sure?'
+	fi
+	result=-1
+	while true; do
+		read -rp "$msg [yes/no] " result
+		case $result in
+			[Yy]* ) result=0; break;;
+			[Nn]* ) result=1; break;;
+			*) echo "Please answer yes or no.";;
+		esac
+	done
+	return $result
+}
+warn() {	# params: message
+    echo "$@" >&2
+}
+die() {	# params: exit code; message
+    rc="$1"
+    shift
+    warn "$@"
+    exit "$rc"
+}
+service_mysql_is_running() {
+	if [ -n "$(command -v service)" ]; then
+		if service mysql status > /dev/null; then
+			return 0
+		fi
+		return 1
+	elif [ -f /etc/init.d/mysql ]; then
+		if /etc/init.d/mysql status > /dev/null; then
+			return 0
+		fi
+		return 1
+	elif [ -f /usr/local/etc/rc.d/mysql ]; then
+		if /usr/local/etc/rc.d/mysql status > /dev/null; then
+			return 0
+		fi
+		return 1
+	else
+		#die 1 "Fix me: I don't know how to determine if mysql is running";
+		if [ -z "$(pidof mysqld)" ]; then
+			return 0
+		fi
+		return 1
+	fi
+}
+service_mysql_start() {
+	printf 'Starting mysql service... '
+	if [ -n "$(command -v service)" ]; then
+		if ! service mysql start; then
+			die $? 'ERROR: Failed to start mysql service!'
+		fi
+	elif [ -f /etc/init.d/mysql ]; then
+		if ! /etc/init.d/mysql start > /dev/null; then
+			die $? 'ERROR: Failed to start mysql service!'
+		fi
+	elif [ -f /usr/local/etc/rc.d/mysql ]; then	# FreeBSD
+		if ! /usr/local/etc/rc.d/mysql start > /dev/null; then
+			die $? 'ERROR: Failed to start mysql service!'
+		fi
+	else
+		die 1 "Fix me: I don't know how to start mysql";
+	fi
+	echo 'OK'
+}
+service_mysql_stop() {
+	printf 'Stopping mysql service... '
+	if [ -n "$(command -v service)" ]; then
+		if ! service mysql stop; then
+			die $? 'ERROR: Failed to stop mysql service!'
+		fi
+	elif [ -f /etc/init.d/mysql ]; then
+		if ! /etc/init.d/mysql stop > /dev/null; then
+			die $? 'ERROR: Failed to stop mysql service!'
+		fi
+	elif [ -f /usr/local/etc/rc.d/mysql ]; then	# FreeBSD
+		if ! /usr/local/etc/rc.d/mysql stop > /dev/null; then
+			die $? 'ERROR: Failed to stop mysql service!'
+		fi
+	else
+		die 1 "Fix me: I don't know how to stop mysql";
+	fi
+	echo 'OK'
+}
+usage() {
+	msg="$*"
+	this=$(basename "$0")
+	if [ -n "$msg" ]; then
+		warn "$this: ERROR: $msg"
+	fi
+	warn "Usage: $this [-[dhky]] start"
+	warn '	Arguments:'
+	#warn "		-c or --continue: Continue after failure. This restores all previously made *.sql.gz files too."
+	warn "		-d or --dry-run: Do not drop databases, remove files from $MYSQL_DATA_DIR, or restore databases."
+	warn '		-h or --help: Show this.'
+	warn '		-k or --keep: Keep backup files.'
+	warn '		-y or --yes: Automatically answer yes to all prompts.'
+	warn "Note: Backups will be made into the current working directory ($(pwd))."
+	if [ -n "$msg" ]; then
+		exit 1
+	fi
+	exit 0
+}
+
+# Command line arguments
+while :
+do
+	case "$1" in
+		-c) CONTINUE=1;;			# undocumented option
+		--continue) CONTINUE=1;;	# undocumented option
+		-d) DRYRUN=1;;
+		--dry-run) DRYRUN=1;;
+		-h) usage;;
+		--help) usage;;
+		-k) KEEP_BACKUPS=1;;
+		--keep) KEEP_BACKUPS=1;;
+		-t) TEST=1;;		# undocumented option
+		--test) TEST=1;;	# undocumented option
+		-y) YES=1;;
+		--yes) YES=1;;
+		#-o) shift; o="$1";;
+		#--) shift; break;;
+		-*) usage "bad argument $1";;
+		*) break;;
+	esac
+	shift
 done
-sudo service $MYSQL_SERVICE stop
-sudo rm -f /var/lib/mysql/ib*
-sudo service $MYSQL_SERVICE start
-if ! test $1; then
-  if [[ "$DBS" != "$SAVE_DBS" ]]; then
-    for DB in $DBS; do
-      if [ -f $DB.sql.gz ]; then
-        echo "Restoring database $DB..."
-        gunzip $DB.sql.gz
-        $MYSQL -u$MYSQL_USER -p$MYSQL_PASS -e "create database if not exists \`$DB\`"
-        $MYSQL -u$MYSQL_USER -p$MYSQL_PASS $DB < $DB.sql
-        if [ $? == 0 ]; then
-          echo "Database $DB restored successfully."
-          rm -f $DB.sql
-        else
-          echo "Restore of database $DB failed."
-        fi
-      fi
-    done
-  fi
+# This forces the use to read the usage before actually running the process
+if [ -z "$*" ] || [ "$*" != 'start' ]; then
+	usage
 fi
-SIZE_AFTER=$(du /var/lib/mysql/ibdata1 | cut -d$'\t' -f1)
-SIZE_SAVED=$(($SIZE_BEFORE-$SIZE_AFTER))
-echo "Shrunk /var/lib/mysql/ibdata1 and recovered $SIZE_SAVED kilobytes."
+if [ -n "$DRYRUN" ]; then
+	echo '*** DRY RUN ***'
+fi
+
+
+# Make sure this script is running as root as sudo is not installed by default on Debian.
+if [ "$(id -u)" -ne 0 ]; then
+	die 1 'This script must be executed as root!';
+fi
+
+
+# Check that $MYSQL_DATA_DIR and the ibdata1 file exist.
+if [ ! -d "$MYSQL_DATA_DIR" ]; then
+	die 1 "Directory $MYSQL_DATA_DIR not found!"
+fi
+IBDATA1_FILE="$MYSQL_DATA_DIR/ibdata1"
+if [ ! -f "$IBDATA1_FILE" ]; then
+	die 1 "$IBDATA1_FILE not found!"
+fi
+
+
+# Check that required binaries are available.
+if [ -z "$(command -v mysql)" ]; then
+	die $? 'MySQL client (mysql) is not installed!'
+fi
+if [ -z "$(command -v mysqldump)" ]; then
+	die $? 'mysqldump not found!'
+fi
+GZIP="$(command -v pigz)"	# compatible with, but faster than gzip
+if [ -z "$GZIP" ]; then
+	GZIP="$(command -v gzip)"
+	if [ -z "$GZIP" ]; then
+		die $? 'gzip not found!'
+	fi
+fi
+
+
+# This line is the only bash dependency:
+if [ "$(basename "$SHELL")" = 'bash' ]; then
+	set -o pipefail
+fi
+
+
+# Make sure mysqld is running
+if service_mysql_is_running; then
+	service_mysql_start
+else
+	echo 'Found active mysql service.'
+fi
+
+
+# Attempt login (first by trying auth_socket authentication, then plain old password authentication)
+MYSQL_PASS=
+if mysql -u"$MYSQL_USER" -e ';' 2>/dev/null; then
+	# password is ignored for auth_socket authentication, but must be at least 1 character if the -p argument is given
+	MYSQL_PASS='dummy'
+else
+	if [ -z "$MYSQL_PASS" ]; then
+		read -rsp "Enter the MySQL $MYSQL_USER password: " MYSQL_PASS
+	fi
+	if ! mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -e ';' 2> /dev/null; then
+		echo 'Invalid password.'
+		exit 1
+	fi
+fi
+
+
+SIZE_BEFORE=$(du "$IBDATA1_FILE" | cut -f1)
+SIZE_BEFORE_HUMAN=$(du -h "$IBDATA1_FILE" | cut -f1)
+echo "Current size of $IBDATA1_FILE: $SIZE_BEFORE_HUMAN"
+
+
+# List databases
+#DATABASES=$( mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" --silent -e 'SHOW DATABASES' | grep -Ev '^(information_schema|mysql|performance_schema)$' )
+if ! DATABASES=$(mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" --silent -e 'SHOW DATABASES'); then
+	die $? 'SHOW DATABASES command failed!'
+fi
+DATABASES=$( echo "$DATABASES" | grep -Ev '^(information_schema|mysql|performance_schema)$' );
+if [ ! $? ]; then
+	die $? 'Failed to grep database list!'
+fi
+echo "Databases to backup into the current directory ($(pwd)) and then drop:"
+for DATABASE in $DATABASES; do
+	echo "	$DATABASE"
+done
+if [ -z "$YES" ] && ! prompt_yn 'Do you really want to continue?'; then
+	exit 0
+fi
+
+
+## Backup and drop databases
+umask 077
+for DATABASE in $DATABASES; do
+	FILE="$DATABASE.sql.gz"
+	printf 'Backup %s to %s... ' "$DATABASE" "$FILE"
+	if ! mysqldump --opt -u"$MYSQL_USER" -p"$MYSQL_PASS" --databases "$DATABASE" | "$GZIP" > "$FILE"; then
+		die $? 'ERROR: mysqldump failed'
+	fi
+	if [ ! -f "$FILE" ]; then
+		die 1 "ERROR: mysqldump indicated success, but $FILE is missing. Something went wrong!"
+	fi
+	echo "OK $(du -h "$FILE" | cut -f1)"
+
+	# Only dump 1 database for testing:
+	if [ -n "$DRYRUN" ] && [ -n "$TEST" ]; then
+		echo 'Only dumping 1 database for testing.'
+		break
+	fi
+
+done
+# Drop databases last as mysqldump may refuse to dump those containing views referencing other already dropped databases.
+for DATABASE in $DATABASES; do
+	printf 'Drop %s... ' "$DATABASE"
+	if [ -z "$DRYRUN" ]; then
+		if ! mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -e "DROP DATABASE \`$DATABASE\`"; then
+			die 1 "ERROR: failed to drop database $DATABASE"
+		fi
+		echo 'OK'
+	else
+		echo '(Skipped in DRY RUN)'
+	fi
+done
+
+
+# Stop mysql; delete ib* files; start mysql
+service_mysql_stop
+for x in "$MYSQL_DATA_DIR"/ibdata? "$MYSQL_DATA_DIR"/ib_logfile*; do
+	if [ -f "$x" ]; then
+		printf 'Remove %s (%s)... ' "$x" "$(du -h "$x" | cut -f1)"
+		if [ -z "$DRYRUN" ]; then
+			if ! rm -f "$x"; then
+				die $? "ERROR: Failed to remove $x"
+			fi
+			echo 'OK'
+		else
+			echo '(Skipped in DRY RUN)'
+		fi
+	fi
+done
+service_mysql_start
+
+# Restoring
+if [ -n "$CONTINUE" ]; then
+	known_databases=''
+	unknown_databases=''
+	for file in *.sql.gz; do
+		known=''
+		database=$( echo "$file" | sed 's/\.sql\.gz$//' );
+		#database=${file//.sql.gz/};
+		for DATABASE in $DATABASES; do
+			if [ "$database" = "$DATABASE" ]; then
+				known_databases="$known_databases $database"
+				known=1
+				break
+			fi
+		done
+		if [ -z "$known" ]; then
+			unknown_databases="$unknown_databases $database"
+		fi
+	done;
+	if [ -n "$unknown_databases" ]; then
+		DATABASES=$( for x in $known_databases $unknown_databases; do echo "$x"; done | sort );
+	else
+		DATABASES=$( for x in $known_databases; do echo "$x"; done | sort );
+	fi
+	echo 'Databases to restore:'
+	for DATABASE in $DATABASES; do
+		echo "	$DATABASE"
+	done
+	if [ -z "$YES" ] && ! prompt_yn 'Do you really want to continue?'; then
+		exit 0
+	fi
+fi
+for DATABASE in $DATABASES; do
+	FILE="$DATABASE.sql.gz"
+	if [ -f "$FILE" ]; then
+		printf 'Restore %s to database %s... ' "$FILE" "$DATABASE"
+		if [ -z "$DRYRUN" ]; then
+			if ! "$GZIP" -dc "$FILE" | mysql -u"$MYSQL_USER" -p"$MYSQL_PASS"; then
+				die $? 'ERROR'
+			fi
+			echo 'OK'
+			if [ -z "$KEEP_BACKUPS" ]; then
+				rm -f "$FILE"
+			fi
+		else
+			echo '(Skipped in DRY RUN)'
+		fi
+	fi
+done
+
+
+# Statistics
+echo "Size of $IBDATA1_FILE before shrinking: $SIZE_BEFORE_HUMAN"
+SIZE_AFTER_HUMAN=$(du -h "$IBDATA1_FILE" | cut -f1)
+SIZE_AFTER=$(du "$IBDATA1_FILE" | cut -f1)
+printf "Size of %s after shrinking: %s (%.1f%% of original; space recovered=%d bytes)\n" \
+	"$IBDATA1_FILE" \
+	"$SIZE_AFTER_HUMAN" \
+	"$(awk "BEGIN { print "100*"$SIZE_AFTER"/"$SIZE_BEFORE"" }")" \
+	"$(("$SIZE_BEFORE"-"$SIZE_AFTER"))"
