@@ -240,7 +240,7 @@ umask 077
 for DATABASE in $DATABASES; do
 	FILE="$DATABASE.sql.gz"
 	printf 'Backup %s to %s... ' "$DATABASE" "$FILE"
-	if ! mysqldump --opt -u"$MYSQL_USER" -p"$MYSQL_PASS" --databases "$DATABASE" | "$GZIP" > "$FILE"; then
+	if ! mysqldump --routines --opt -u"$MYSQL_USER" -p"$MYSQL_PASS" --databases "$DATABASE" | "$GZIP" > "$FILE"; then
 		die $? 'ERROR: mysqldump failed'
 	fi
 	if [ ! -f "$FILE" ]; then
